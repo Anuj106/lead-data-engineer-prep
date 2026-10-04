@@ -367,4 +367,213 @@ Tier 2: events has 20 billion rows and a few bot user_ids with billions of event
 
 Tier 3: Turn problem 4 into an idempotent incremental pipeline step. How do late-arriving versions, reruns and backfills behave?
 
+-----------------------------------
+DEATILED EXPLANATION OF PART 4,5,6
+------------------------------------
+
+Part 4 (Redone): Frames
+What a frame is
+
+PARTITION BY splits rows into groups. ORDER BY sorts the rows inside each group. The frame answers a third question: for the current row, which of those sorted rows should the function look at?
+
+Think of a magnifying glass sliding down the sorted rows. For each row, the frame is the part of the partition the glass covers.
+
+The frame is written as ROWS BETWEEN <start> AND <end>, with these building blocks:
+
+Keyword	Meaning
+UNBOUNDED PRECEDING	the first row of the partition
+n PRECEDING	n rows before the current row
+CURRENT ROW	the current row
+n FOLLOWING	n rows after the current row
+UNBOUNDED FOLLOWING	the last row of the partition
+
+So ROWS BETWEEN 2 PRECEDING AND CURRENT ROW means "this row and the two before it," a 3-row window.
+
+Trap 1: RANGE vs ROWS (the default-frame bug)
+
+Take this table, sorted by order_date:
+
+row	order_date	amount
+A	Oct 1	10
+B	Oct 2	20
+C	Oct 2	30
+D	Oct 3	5
+
+Compare two running totals:
+
+sql
+SUM(amount) OVER (ORDER BY order_date ROWS  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+SUM(amount) OVER (ORDER BY order_date RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+row	ROWS result	RANGE result
+A	10	10
+B	30	60
+C	60	60
+D	65	65
+ROWS counts physical rows: "everything up to and including this exact row." Row B sees A + B = 30.
+RANGE counts by value: "everything up to and including all rows with the same order_date as me." B and C are peers (both Oct 2), so both include each other: 10 + 20 + 30 = 60.
+
+The reason this is a trap: if you write ORDER BY and no frame, the default is RANGE. So a running total over data with duplicate dates jumps by a whole day's worth at once, and nobody notices because no error appears. The habit that prevents this: whenever you mean "running total," write ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW explicitly.
+
+Trap 2: LAST_VALUE returns the wrong thing
+
+Rows sorted by day, with values 10, 20, 30. You want the partition's last value (30) on every row:
+
+sql
+LAST_VALUE(val) OVER (ORDER BY day)
+
+Result: 10, 20, 30, not 30, 30, 30. The default frame ends at CURRENT ROW, so "the last row in my frame" is always the current row itself. The fix is to widen the frame to the end:
+
+sql
+LAST_VALUE(val) OVER (ORDER BY day
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+
+Now every row's frame covers the whole partition, so every row gets 30. (FIRST_VALUE has no such problem because the frame always starts at the beginning.)
+
+Trap 3: "7-row" is not "7-day"
+
+A 7-day moving average is often written like this:
+
+sql
+AVG(revenue) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+
+That means "the current row plus the 6 rows before it." It equals 7 days only if there is exactly one row per day with no gaps. Suppose you have rows for Oct 1, Oct 2 and Oct 5 (nothing on Oct 3 and 4). For the Oct 5 row, a 3-row frame would include Oct 1, Oct 2 and Oct 5, which spans five calendar days, not three.
+
+Fixes: first join to a date spine (a table with one row per calendar day, with zero revenue filled in), or use a RANGE frame over a date interval if your engine supports it.
+
+Part 5 (Redone): The Patterns, Traced Step by Step
+Pattern A: Dedupe (latest row per key)
+
+Source table customers, with several versions per customer:
+
+customer_id	email	updated_at
+1	a@old.com	Jan 1
+1	a@new.com	Mar 1
+2	b@x.com	Feb 1
+sql
+SELECT * FROM customers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC) = 1;
+
+Read it in plain words: "Group rows by customer. Within each group, sort newest first. Number them 1, 2, 3... Keep only number 1." Customer 1's Mar 1 row gets 1 and survives, and the Jan 1 row gets 2 and is dropped. Customer 2 keeps its only row. (QUALIFY is the Snowflake/BigQuery shortcut. In other engines, put the ROW_NUMBER in a CTE and filter rn = 1.)
+
+Pattern B: Sessionization, traced
+
+Goal: split one user's events into sessions, where a gap of more than 30 minutes starts a new session.
+
+One user's events, already sorted:
+
+step	event_ts
+1	10:00
+2	10:10
+3	10:50
+4	11:00
+5	12:30
+
+Step 1: look at the previous event with LAG.
+
+event_ts	previous event	gap
+10:00	NULL	n/a
+10:10	10:00	10 min
+10:50	10:10	40 min
+11:00	10:50	10 min
+12:30	11:00	90 min
+
+Step 2: flag a "new session starts here" when there is no previous event or the gap exceeds 30 minutes.
+
+event_ts	new_session
+10:00	1 (first event)
+10:10	0
+10:50	1 (gap 40)
+11:00	0
+12:30	1 (gap 90)
+
+Step 3: running sum of the flags. This is the key idea: every new-session flag bumps a counter, and the counter becomes the session ID.
+
+event_ts	new_session	running sum = session_id
+10:00	1	1
+10:10	0	1
+10:50	1	2
+11:00	0	2
+12:30	1	3
+
+Result: session 1 = {10:00, 10:10}, session 2 = {10:50, 11:00}, session 3 = {12:30}.
+
+The shape to memorize: detect a boundary with LAG → flag it with 1 → cumulative SUM of the flags gives a group ID. It solves many problems beyond sessions, such as "group consecutive rows until some condition changes."
+
+Pattern C: Gaps and islands, traced
+
+Goal: find consecutive-day login streaks. One user's distinct login dates, numbered with ROW_NUMBER in date order:
+
+login_date	row_number	login_date − row_number (days)
+Oct 1	1	Sep 30
+Oct 2	2	Sep 30
+Oct 3	3	Sep 30
+Oct 5	4	Oct 1
+Oct 6	5	Oct 1
+Oct 9	6	Oct 3
+
+Why the subtraction works: inside an unbroken streak, the date goes up by 1 each row and the row number goes up by 1 each row, so the difference never changes. When a day is skipped (Oct 4 is missing), the date jumps by 2 while the row number goes up by only 1, so the difference changes, and that signals a new streak.
+
+Group by that difference and you get the islands:
+
+difference Sep 30 → Oct 1 to Oct 3 (3 days)
+difference Oct 1 → Oct 5 to Oct 6 (2 days)
+difference Oct 3 → Oct 9 (1 day)
+
+The difference values themselves (Sep 30, Oct 1...) are meaningless labels, and only "same or different" matters. Also note why the query used DISTINCT first: a duplicate login date would increase the row number without moving the date, and that would break the arithmetic.
+
+Part 6 (Redone): The Lead-Level Layer, in Plain Language
+
+These points are about how window functions behave at scale, which is what separates a lead answer from a standard one.
+
+1. Cost: windows need sorted, grouped data
+
+To compute OVER (PARTITION BY user_id ORDER BY event_ts), the engine needs all rows of a given user in one place, sorted by time.
+
+On one machine, that means a sort.
+On a cluster (Spark, Snowflake, BigQuery), the rows for a user are scattered across many machines, so the engine must shuffle: send data across the network so that every row for a given user_id lands on the same worker. Shuffles are among the most expensive operations in distributed systems.
+
+Practical consequences:
+
+Reuse one window spec across many functions. If you compute LAG, a running sum and a ROW_NUMBER over the same PARTITION BY ... ORDER BY, the engine can sort and shuffle once. Different specs may force repeated work. You can name a spec once:
+sql
+  SELECT user_id, event_ts,
+         LAG(event_ts) OVER w AS prev_ts,
+         ROW_NUMBER()  OVER w AS rn
+  FROM events
+  WINDOW w AS (PARTITION BY user_id ORDER BY event_ts);
+Shrink the data before the window. Filter rows and drop unneeded columns first, because the shuffle and sort cost scales with data volume.
+2. Skew: one overloaded worker
+
+Imagine PARTITION BY user_id and one user (a bot) owns 30% of all rows. All of that user's rows must go to one worker, so that worker does 30% of the work while the others finish early and wait. The whole job runs at the speed of the slowest worker.
+
+A related variant: rows where user_id is NULL all fall into one partition, which can be enormous. Defenses: filter out NULLs and known bot IDs before the window, and handle them separately if needed.
+
+3. Dedupe and idempotency
+
+The dedupe pattern from Pattern A is the heart of most incremental pipelines: "keep the latest version of each record." The lead-level detail is the tie-breaker. If two versions share the same updated_at, ROW_NUMBER picks one arbitrarily, and a rerun might pick the other, so your output changes between runs. Adding ORDER BY updated_at DESC, ingest_id DESC makes the result deterministic, which is what "idempotent" requires.
+
+4. Window function vs. self-join
+
+Task: for each order, find the user's previous order amount.
+
+sql
+-- Self-join (clumsy: needs a subquery to find "the previous row", easy to get wrong, often slower)
+SELECT o.order_id, o.amount, p.amount AS prev_amount
+FROM orders o
+LEFT JOIN orders p
+  ON p.user_id = o.user_id
+ AND p.order_date = (SELECT MAX(order_date) FROM orders x
+                     WHERE x.user_id = o.user_id AND x.order_date < o.order_date);
+
+-- Window (one pass, one line of logic)
+SELECT order_id, amount,
+       LAG(amount) OVER (PARTITION BY user_id ORDER BY order_date) AS prev_amount
+FROM orders;
+
+The window version reads the table once, while the self-join reads it multiple times and is easier to get wrong. Interviewers like seeing you reach for the window version first.
+
+Check Your Understanding (answer in your own words)
+In the A/B/C/D table above, what does SUM(amount) OVER (ORDER BY order_date) (no frame written) return for row C, and why?
+Sessionization: why do we take a running sum of the flags? What would a plain SUM over the whole partition give you?
+A job with PARTITION BY user_id runs 10x slower than expected. Name two things you'd check.
 
