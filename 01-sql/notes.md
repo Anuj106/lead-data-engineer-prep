@@ -227,3 +227,144 @@ Hash Join  (actual time=4200..9800 rows=48000000)
 
 ----------------------------------------------------------------------------------------------------------------------------------------------------
 ----------------------------------------------------------------------------------------------------------------------------------------------------
+Week 2, Lecture 1: Window Functions
+
+Window functions are the single most tested SQL topic in data engineering loops. The Week 1 coding problems stay open on your list, so come back to them when you have time. Create a branch for the week: git switch -c w02-sql-windows.
+
+Part 1: The Core Idea
+
+GROUP BY collapses rows: 48M rows in, one row per group out. A window function keeps every row and attaches a computed value derived from a related set of rows (the "window").
+
+sql
+function(...) OVER (
+  PARTITION BY ...   -- which rows are related (like GROUP BY, but no collapsing)
+  ORDER BY ...       -- ordering within the partition
+  frame clause       -- which rows around the current row to include
+)
+
+Think of it as: for each row, look at its neighbors within its partition, and compute something.
+
+Where it sits in the processing order (extending Lecture 1): windows are evaluated after GROUP BY and HAVING, and just before SELECT's final projection and DISTINCT. Consequence: you cannot filter on a window function in WHERE. Wrap it in a CTE or subquery, or use QUALIFY in Snowflake and BigQuery:
+
+sql
+-- Standard SQL
+WITH ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_date DESC) AS rn
+  FROM orders
+)
+SELECT * FROM ranked WHERE rn = 1;
+
+-- Snowflake / BigQuery shortcut
+SELECT * FROM orders
+QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_date DESC) = 1;
+Part 2: Ranking Functions
+Function	Ties	Example over values 100, 100, 90
+ROW_NUMBER()	Arbitrary but unique	1, 2, 3
+RANK()	Same rank, then gaps	1, 1, 3
+DENSE_RANK()	Same rank, no gaps	1, 1, 2
+
+Choosing is a requirements question. "Top 3 products per category" with ties: do you want exactly 3 rows (ROW_NUMBER), or everyone tied for the top 3 (DENSE_RANK)? Ask the interviewer. That clarifying question is a lead-level signal.
+
+Determinism warning. If ORDER BY has ties, ROW_NUMBER picks arbitrarily, and the result can change between runs. In pipelines, always add a tie-breaker: ORDER BY updated_at DESC, ingest_id DESC.
+
+Part 3: Navigation Functions
+LAG(col, n, default) looks at the previous row, LEAD at the next.
+FIRST_VALUE, LAST_VALUE, NTH_VALUE.
+sql
+SELECT order_date, revenue,
+       revenue - LAG(revenue) OVER (ORDER BY order_date) AS dod_change
+FROM daily_revenue;
+
+The first row has no predecessor, so LAG returns NULL. Decide how you handle it (default value or leave NULL), and guard divisions for percentage change with NULLIF(prev, 0).
+
+Part 4: Frames, Where Most Bugs Live
+
+The frame says which rows around the current one feed an aggregate:
+
+sql
+SUM(amount) OVER (
+  PARTITION BY user_id
+  ORDER BY order_date
+  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW   -- running total
+)
+
+Two traps, both frequently asked:
+
+Default frame. When ORDER BY is present and you don't specify a frame, the default is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW. RANGE treats rows with equal ORDER BY values as peers and includes all of them. So a running total with duplicate dates jumps by the whole group at once. Write ROWS explicitly when you mean "row by row."
+LAST_VALUE. With the default frame, LAST_VALUE(x) returns the current row's value (the frame ends at the current row), not the partition's last value. Fix: ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, or use FIRST_VALUE with a reversed order.
+
+Moving average caveat. ROWS BETWEEN 6 PRECEDING AND CURRENT ROW means the last 7 rows, which equals 7 days only if every day has a row. With missing days, you need a calendar table (join to a date spine first) or a RANGE frame with an interval, where your engine supports it.
+
+Part 5: The Patterns You Must Know Cold
+
+1. Deduplicate / latest record per key (every pipeline uses this):
+
+sql
+SELECT * FROM customers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC, ingest_id DESC) = 1;
+
+2. Top-N per group: ranking function plus filter, as above.
+
+3. Running totals and moving averages: frames, as above.
+
+4. Sessionization. Group a user's events into sessions, where a gap of more than 30 minutes starts a new session. The technique is flag, then cumulative sum:
+
+sql
+WITH flagged AS (
+  SELECT user_id, event_ts,
+         CASE WHEN LAG(event_ts) OVER (PARTITION BY user_id ORDER BY event_ts) IS NULL
+                OR event_ts - LAG(event_ts) OVER (PARTITION BY user_id ORDER BY event_ts)
+                   > INTERVAL '30 minutes'
+              THEN 1 ELSE 0 END AS new_session
+  FROM events
+)
+SELECT user_id, event_ts,
+       SUM(new_session) OVER (PARTITION BY user_id ORDER BY event_ts
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_id
+FROM flagged;
+
+Each "new session" flag adds 1, so the running sum becomes a session counter. Learn this shape; it reappears in many problems.
+
+5. Gaps and islands (consecutive streaks): subtracting a row number from a sequential value gives a constant for each unbroken run.
+
+sql
+WITH d AS (SELECT DISTINCT user_id, login_date FROM logins),
+g AS (
+  SELECT user_id, login_date,
+         login_date - (ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date))::int AS grp
+  FROM d
+)
+SELECT user_id, MIN(login_date) AS streak_start, MAX(login_date) AS streak_end, COUNT(*) AS streak_len
+FROM g GROUP BY user_id, grp;
+
+Why it works: consecutive dates increase by 1, and the row number also increases by 1, so their difference stays constant within a streak and jumps at each gap. Note the DISTINCT first, because duplicate dates would break the arithmetic. (Postgres syntax; adjust date arithmetic for your engine.)
+
+Part 6: The Lead-Level Layer
+Cost. Each distinct PARTITION BY ... ORDER BY needs data sorted by partition. In a distributed engine that means a shuffle on the partition key. Reusing the same window spec across several functions lets the engine share one sort, and you can name it with a WINDOW w AS (...) clause.
+Skew. If PARTITION BY user_id has one key (a bot, or NULL) with 30% of the rows, one worker handles 30% of the data. Filter out junk keys first, and watch for NULL partitions.
+Reduce data first. Filter and project before the window, because the sort cost scales with row count.
+Dedupe in pipelines. The ROW_NUMBER dedupe is the heart of idempotent incremental loads, and the tie-breaker keeps reruns deterministic. This links to the MERGE discussion from Week 1 and to Week 7 (dbt incremental models).
+Window vs. self-join. A window function usually replaces a self-join (e.g. comparing each row to the previous) with a single pass, which is both simpler and faster.
+Homework (about 2 hours total)
+
+Use orders(order_id, user_id, order_date, status, amount), users(user_id, signup_date, country), events(user_id, event_ts, event_type), logins(user_id, login_date), and customers(customer_id, name, email, updated_at, ingest_id) with multiple versions per customer. Target times in brackets.
+
+Conceptual (2 to 3 sentences each, into 02 notes in 01-sql/interview.md):
+
+Why can't you write WHERE ROW_NUMBER() OVER (...) = 1, and what are two ways around it?
+A running total over a RANGE frame jumps unexpectedly on days with multiple orders. Why?
+
+Coding (01-sql/exercises.sql, add a -- time: N min comment to each):
+
+Top 3 orders by amount per country. State whether you chose ROW_NUMBER or DENSE_RANK and why. [12 min]
+Day-over-day revenue change as a percentage, handling the first day and zero-revenue days. [12 min]
+7-day moving average of daily revenue. Describe what breaks if some days have no orders. [15 min]
+Latest version of each customer, deterministic on ties. [8 min]
+Sessionize events with a 30-minute gap and output, per session, start, end and event count. [20 min]
+Longest consecutive login streak per user. [20 min]
+
+Tier 2: events has 20 billion rows and a few bot user_ids with billions of events each. What happens to your sessionization query, and how would you fix it?
+
+Tier 3: Turn problem 4 into an idempotent incremental pipeline step. How do late-arriving versions, reruns and backfills behave?
+
+
