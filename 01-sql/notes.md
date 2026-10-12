@@ -577,3 +577,182 @@ In the A/B/C/D table above, what does SUM(amount) OVER (ORDER BY order_date) (no
 Sessionization: why do we take a running sum of the flags? What would a plain SUM over the whole partition give you?
 A job with PARTITION BY user_id runs 10x slower than expected. Name two things you'd check.
 
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+SQL Lecture: Funnels, Retention, Cohorts, Date Spines, Pivots, Recursion
+Part 1: Funnels
+
+Question: of the users who viewed a product, how many added to cart, and of those, how many purchased?
+
+Table: events(user_id, event_ts, event_type). Take three users:
+
+user	events in time order
+A	view, add_to_cart, purchase
+B	view, add_to_cart
+C	add_to_cart, view
+
+Step 1: one row per user, with the first time they hit each step.
+
+sql
+WITH steps AS (
+  SELECT user_id,
+    MIN(CASE WHEN event_type = 'view'        THEN event_ts END) AS t_view,
+    MIN(CASE WHEN event_type = 'add_to_cart' THEN event_ts END) AS t_cart,
+    MIN(CASE WHEN event_type = 'purchase'    THEN event_ts END) AS t_purchase
+  FROM events
+  GROUP BY user_id
+)
+
+CASE returns NULL for non-matching events and MIN ignores NULLs, so each column holds that step’s earliest timestamp, or NULL if the user never did it.
+
+Step 2: count users who completed each step in order.
+
+sql
+SELECT
+  COUNT(t_view)                                              AS viewed,
+  COUNT(CASE WHEN t_cart > t_view THEN 1 END)                AS carted,
+  COUNT(CASE WHEN t_cart > t_view AND t_purchase > t_cart THEN 1 END) AS purchased
+FROM steps;
+
+Tracing the three users:
+
+A: viewed, cart after view, purchase after cart. Counted at all three steps.
+B: viewed, cart after view, no purchase. Counted at viewed and carted.
+C: carted before viewing, so t_cart > t_view is false. Counted only at viewed.
+
+Result: viewed 3, carted 2, purchased 1. Conversion rates are carted / NULLIF(viewed, 0) and so on. The NULLIF guards against division by zero.
+
+The honest caveat. Using the first cart time can undercount. If a user added to cart before viewing, and again after viewing, the first cart fails the check even though a valid one exists. For strict funnels, find “the first cart event after the view” with a join or a window function per step. In an interview, say which definition you’re using.
+
+Part 2: Cohorts and Retention
+
+Definitions.
+
+Cohort: a group of users who share a start event, such as the same signup month.
+Retention at period N: of the cohort’s users, the share who were active in the Nth period after joining.
+
+Ambiguity to resolve with the interviewer: classic retention counts users active on day N exactly. Rolling retention counts users active on or after day N. They produce different numbers, so always ask.
+
+Trace. Four users:
+
+user	signup month	active months
+1	Jan	Jan, Feb, Mar
+2	Jan	Jan
+3	Jan	Jan, Mar
+4	Feb	Feb, Mar
+
+Cohort Jan has 3 users. Month N is “months since signup”:
+
+cohort	N=0	N=1	N=2
+Jan	3 (100%)	1 (user 1) = 33%	2 (users 1, 3) = 67%
+Feb	1 (100%)	1 (user 4) = 100%	n/a yet
+
+Note that retention can go up (user 3 returns in March), which classic retention allows.
+
+The query shape: cohort, activity, join, count.
+
+sql
+WITH cohort AS (
+  SELECT user_id, DATE_TRUNC('month', signup_date)::date AS cohort_month
+  FROM users
+),
+activity AS (
+  SELECT DISTINCT user_id, DATE_TRUNC('month', order_date)::date AS active_month
+  FROM orders
+),
+joined AS (
+  SELECT c.cohort_month,
+         ((EXTRACT(YEAR FROM a.active_month) - EXTRACT(YEAR FROM c.cohort_month)) * 12
+          + EXTRACT(MONTH FROM a.active_month) - EXTRACT(MONTH FROM c.cohort_month))::int AS month_n,
+         a.user_id
+  FROM cohort c
+  JOIN activity a USING (user_id)
+  WHERE a.active_month >= c.cohort_month
+),
+sizes AS (
+  SELECT cohort_month, COUNT(*) AS cohort_size FROM cohort GROUP BY cohort_month
+)
+SELECT j.cohort_month, j.month_n,
+       COUNT(DISTINCT j.user_id) AS active_users,
+       ROUND(COUNT(DISTINCT j.user_id)::numeric / s.cohort_size, 3) AS retention
+FROM joined j
+JOIN sizes s USING (cohort_month)
+GROUP BY j.cohort_month, j.month_n, s.cohort_size
+ORDER BY 1, 2;
+
+Read it as four steps: label each user’s cohort, list each user’s active months (DISTINCT prevents counting a user twice in one month), compute months-since-signup, and count users per cohort and month. The result is in “long” form. The triangle-shaped report is a pivot of it (Part 4).
+
+Part 3: Date Spines (filling in missing days)
+
+A date spine is a table with one row per calendar day. You LEFT JOIN your facts onto it so days with no activity appear with zero instead of vanishing, which is exactly what broke the moving-average problem.
+
+sql
+SELECT d::date AS day,
+       COALESCE(SUM(o.amount), 0) AS revenue
+FROM generate_series(DATE '2025-01-01', DATE '2026-10-01', INTERVAL '1 day') AS d
+LEFT JOIN orders o
+  ON o.order_date = d::date
+ AND o.status = 'completed'      -- filter in ON, not WHERE (the Lecture 1 trap)
+GROUP BY d
+ORDER BY d;
+
+generate_series is Postgres. In Snowflake use a generator or a calendar table, and in BigQuery use GENERATE_DATE_ARRAY. In production, most teams keep a permanent dim_date table.
+
+Part 4: Pivot and Unpivot
+
+Pivot (rows to columns) is conditional aggregation, the portable method that works everywhere:
+
+sql
+SELECT country,
+  SUM(CASE WHEN status = 'completed' THEN amount END) AS completed_amt,
+  SUM(CASE WHEN status = 'refunded'  THEN amount END) AS refunded_amt
+FROM orders o JOIN users u USING (user_id)
+GROUP BY country;
+
+Unpivot (columns to rows) uses UNION ALL, or CROSS JOIN LATERAL (VALUES ...) in Postgres:
+
+sql
+SELECT country, 'completed' AS metric, completed_amt AS value FROM t
+UNION ALL
+SELECT country, 'refunded',  refunded_amt FROM t;
+
+Native PIVOT/UNPIVOT keywords exist in Snowflake and SQL Server, but the column list must be hardcoded, which is why interviewers accept the conditional-aggregation form.
+
+Part 5: Recursive CTEs
+
+Use these for hierarchies of unknown depth (org charts, category trees, bill of materials). A recursive CTE has two parts joined by UNION ALL:
+
+Anchor: the starting rows.
+Recursive step: joins the table to the previous round’s output, repeating until no new rows appear.
+sql
+WITH RECURSIVE chain AS (
+  SELECT employee_id, manager_id, 1 AS depth
+  FROM employees
+  WHERE manager_id IS NULL                      -- anchor: the top of the org
+  UNION ALL
+  SELECT e.employee_id, e.manager_id, c.depth + 1
+  FROM employees e
+  JOIN chain c ON e.manager_id = c.employee_id  -- recursive step
+)
+SELECT * FROM chain;
+
+Trace with CEO (1) → VP (2) → Engineer (3):
+
+Round 0 (anchor): CEO, depth 1.
+Round 1: rows whose manager is the CEO, which gives VP, depth 2.
+Round 2: rows whose manager is the VP, which gives Engineer, depth 3.
+Round 3: nothing matches, so it stops.
+
+Danger: cycles. If data contains A managing B and B managing A, the recursion never ends. Protect with a depth cap (WHERE c.depth < 20) or track the visited path.
+
+Part 6: The Lead-Level Layer
+Metric definitions come first. “Active user” and “retained” must be defined once (active = at least one completed order, say, in the period) and implemented in a single governed model. Otherwise two dashboards give two retention numbers.
+Work at user-day grain. Pre-aggregate raw events to one row per user per day, and build funnels, retention and cohorts on that small table. It’s cheaper, and it’s the incremental pattern from Week 1.
+Approximate counts at scale. COUNT(DISTINCT) over billions of rows is expensive. Warehouses offer HyperLogLog (APPROX_COUNT_DISTINCT) with about 1 to 2% error, which is acceptable for dashboards but not for finance.
+Time zones and boundaries. “Day” depends on whose midnight. Decide on UTC or the user’s local time, store it, and document it, because boundary mistakes are a common source of retention bugs.
+Idempotent builds. A cohort table rebuilt nightly should overwrite its partitions or use MERGE, so reruns don’t double-count.
+Check Your Understanding (for when you practice)
+In the funnel trace, why is user C counted at “viewed” but not “carted”?
+Retention can increase from N=1 to N=2. Which definition permits that, and which would make it non-increasing?
+Why must the date-spine query filter status in the ON clause?
+What stops a recursive CTE from running forever?
